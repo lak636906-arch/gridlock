@@ -1,8 +1,13 @@
+import asyncio
+import json
 import math
+import os
 import random
+import sys
 import time
 import pygame
-import sys
+
+IS_WEB = (sys.platform == "emscripten")
 
 # --- CONFIGURATION & COLORS ---
 BG_MAIN = (22, 21, 18)
@@ -42,6 +47,10 @@ BLACK_OUTLINE = (235, 235, 235)
 ROWS, COLS = 8, 8
 PROMOTION_CAPTURES_REQUIRED = 5
 MOVE_GLIDE_DURATION = 0.16
+ALIN_SAVE_FILE = "alin_rating.json"
+ALIN_STORAGE_KEY = "geometric_chess_alin_profile"
+DEFAULT_ALIN = 1000
+ALIN_LOSS_EXPONENT = 1.2
 
 BOT_LEVELS = {
     1:  {"name": "Bluechair 1",  "elo": 100,  "desc": "Picks the worst possible moves"},
@@ -62,6 +71,106 @@ BOT_LEVELS = {
 }
 
 
+# --- ALIN RATING SYSTEM (WEB + DESKTOP PERSISTENCE) ---
+
+def load_alin_profile():
+    default_data = {
+        "alin": DEFAULT_ALIN,
+        "peak_alin": DEFAULT_ALIN,
+        "wins": 0,
+        "losses": 0,
+        "draws": 0,
+        "defeated_bots": [],
+    }
+    if IS_WEB:
+        try:
+            import platform
+            raw = platform.window.localStorage.getItem(ALIN_STORAGE_KEY)
+            if raw:
+                loaded = json.loads(raw)
+                for k, v in default_data.items():
+                    loaded.setdefault(k, v)
+                return loaded
+        except Exception:
+            pass
+        return default_data
+
+    if not os.path.exists(ALIN_SAVE_FILE):
+        return default_data
+    try:
+        with open(ALIN_SAVE_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        for k, v in default_data.items():
+            loaded.setdefault(k, v)
+        return loaded
+    except (OSError, ValueError):
+        return default_data
+
+
+def save_alin_profile(profile):
+    if IS_WEB:
+        try:
+            import platform
+            platform.window.localStorage.setItem(ALIN_STORAGE_KEY, json.dumps(profile))
+        except Exception:
+            pass
+        return
+
+    try:
+        with open(ALIN_SAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(profile, f, indent=2)
+    except OSError:
+        pass
+
+
+def get_alin_tier(alin_val):
+    if alin_val < 600:
+        return "Tacker"
+    elif alin_val < 1100:
+        return "Diamond"
+    elif alin_val < 1600:
+        return "Hook"
+    elif alin_val < 2200:
+        return "Hop"
+    elif alin_val < 2800:
+        return "Master"
+    return "Grandmaster"
+
+
+def calculate_alin_change(player_alin, opp_alin, full_moves, outcome):
+    """
+    Alin Rating Formula (used for vs. Real Players):
+    - If diff >= 200 and lower-rated player wins:
+        * Lower-rated winner always gains +150 Alin
+        * Higher-rated loser always loses -120 Alin
+    - Otherwise (including when the lower-rated player loses):
+        * Win:  alin + (max(10, 150 - moves) / 5) * ((opp_alin + player_alin) / 2000)
+        * Lose: max(0, alin - ((max(10, 150 - moves) / 10) * ((opp_alin + player_alin) / 2000)) ** 1.2)
+        * Draw: max(0, alin + (opp_alin - player_alin) / 20)
+    """
+    moves = max(1, int(full_moves))
+    base = max(10.0, 150.0 - moves)
+    avg_scale = (opp_alin + player_alin) / 2000.0
+
+    if outcome == "win":
+        if opp_alin - player_alin >= 200:
+            new_alin = player_alin + 150.0
+        else:
+            new_alin = player_alin + (base / 5.0) * avg_scale
+    elif outcome == "lose":
+        if player_alin - opp_alin >= 200:
+            new_alin = max(0.0, player_alin - 120.0)
+        else:
+            penalty = ((base / 10.0) * avg_scale) ** ALIN_LOSS_EXPONENT
+            new_alin = max(0.0, player_alin - penalty)
+    else:
+        new_alin = max(0.0, player_alin + (opp_alin - player_alin) / 20.0)
+
+    rounded_new = int(round(new_alin))
+    delta = rounded_new - int(round(player_alin))
+    return rounded_new, delta
+
+
 class Piece:
     def __init__(self, color, name):
         self.color = color
@@ -79,12 +188,12 @@ def create_board():
 
     # --- BLACK PIECES (Top: Ranks 8 and 7) ---
     board[0][0] = Piece("Black", "Hook")     # a8
-    board[0][1] = Piece("Black", "Hopper")      # b8
+    board[0][1] = Piece("Black", "Hop")      # b8
     board[0][2] = Piece("Black", "Diamond")  # c8
     board[0][3] = Piece("Black", "Master")   # d8
     board[0][4] = Piece("Black", "King")     # e8
     board[0][5] = Piece("Black", "Diamond")  # f8
-    board[0][6] = Piece("Black", "Hopper")      # g8
+    board[0][6] = Piece("Black", "Hop")      # g8
     board[0][7] = Piece("Black", "Hook")     # h8
     for col in range(COLS):
         board[1][col] = Piece("Black", "Tacker")  # a7 - h7
@@ -93,12 +202,12 @@ def create_board():
     for col in range(COLS):
         board[6][col] = Piece("White", "Tacker")  # a2 - h2
     board[7][0] = Piece("White", "Hook")     # a1
-    board[7][1] = Piece("White", "Hopper")      # b1
+    board[7][1] = Piece("White", "Hop")      # b1
     board[7][2] = Piece("White", "Diamond")  # c1
     board[7][3] = Piece("White", "Master")   # d1
     board[7][4] = Piece("White", "King")     # e1
     board[7][5] = Piece("White", "Diamond")  # f1
-    board[7][6] = Piece("White", "Hopper")      # g1
+    board[7][6] = Piece("White", "Hop")      # g1
     board[7][7] = Piece("White", "Hook")     # h1
 
     return board
@@ -862,14 +971,17 @@ def pick_bot_move(board, color, level):
     if len(moves) == 1:
         return moves[0]
 
+    # Scale down time budgets slightly on web WASM for responsive frames
+    web_scale = 0.55 if IS_WEB else 1.0
+
     if level == 1:
-        scored = score_all_root_moves(board, color, depth=2, use_quiescence=True, time_budget=0.35)
+        scored = score_all_root_moves(board, color, depth=2, use_quiescence=True, time_budget=0.35 * web_scale)
         worst_score = scored[-1][0]
         worst_moves = [m for sc, m in scored if sc <= worst_score + 10]
         return random.choice(worst_moves)
 
     if level == 2:
-        scored = score_all_root_moves(board, color, depth=2, use_quiescence=False, time_budget=0.25)
+        scored = score_all_root_moves(board, color, depth=2, use_quiescence=False, time_budget=0.25 * web_scale)
         cutoff = max(1, len(scored) // 6)
         return random.choice([m for _, m in scored[-cutoff:]])
 
@@ -906,32 +1018,32 @@ def pick_bot_move(board, color, level):
         return random.choice([m for sc, m in scored if sc >= best_sc - 25])
 
     if level == 9:
-        scored = score_all_root_moves(board, color, depth=2, use_quiescence=False, time_budget=0.25)
+        scored = score_all_root_moves(board, color, depth=2, use_quiescence=False, time_budget=0.25 * web_scale)
         noisy = [(sc + random.gauss(0, 75), m) for sc, m in scored]
         noisy.sort(key=lambda x: x[0], reverse=True)
         return noisy[0][1]
 
     if level == 10:
-        scored = score_all_root_moves(board, color, depth=2, use_quiescence=False, time_budget=0.35)
+        scored = score_all_root_moves(board, color, depth=2, use_quiescence=False, time_budget=0.35 * web_scale)
         best_sc = scored[0][0]
         return random.choice([m for sc, m in scored if sc >= best_sc - 12])
 
     if level == 11:
-        scored = score_all_root_moves(board, color, depth=2, use_quiescence=True, time_budget=0.45)
+        scored = score_all_root_moves(board, color, depth=2, use_quiescence=True, time_budget=0.45 * web_scale)
         best_sc = scored[0][0]
         return random.choice([m for sc, m in scored if sc >= best_sc - 8])
 
     if level == 12:
-        scored = score_all_root_moves(board, color, depth=3, use_quiescence=False, time_budget=0.55)
+        scored = score_all_root_moves(board, color, depth=3, use_quiescence=False, time_budget=0.55 * web_scale)
         best_sc = scored[0][0]
         return random.choice([m for sc, m in scored if sc >= best_sc - 5])
 
     if level == 13:
-        scored = score_all_root_moves(board, color, depth=3, use_quiescence=True, time_budget=0.70)
+        scored = score_all_root_moves(board, color, depth=3, use_quiescence=True, time_budget=0.70 * web_scale)
         return scored[0][1]
 
     if level == 14:
-        deadline = time.perf_counter() + 0.85
+        deadline = time.perf_counter() + (0.85 * web_scale)
         best_move = order_moves(board, moves)[0]
         tt = {}
         for d in range(1, 5):
@@ -942,7 +1054,7 @@ def pick_bot_move(board, color, level):
                 best_move = mv
         return best_move
 
-    deadline = time.perf_counter() + 1.35
+    deadline = time.perf_counter() + (1.35 * web_scale)
     best_move = order_moves(board, moves)[0]
     tt = {}
     for d in range(1, 7):
@@ -1234,7 +1346,7 @@ def draw_board_preview(screen, board, board_x, board_y, board_size, sq_size):
 
 def draw_main_menu(
     screen, win_w, win_h, board, board_x, board_y, board_size, sq_size,
-    mouse_pos, fonts, emoji_font, menu_buttons, btn_exit, menu_notice
+    mouse_pos, fonts, emoji_font, menu_buttons, btn_exit, menu_notice, alin_profile
 ):
     font_hero, font_title, font_bold, font_med, font_small, _ = fonts
     screen.fill(BG_MAIN)
@@ -1250,22 +1362,32 @@ def draw_main_menu(
     btn_w = min(380, left_area_w - 60)
     btn_h = 62
     btn_gap = 14
-    total_block_h = 68 + 5 * btn_h + 4 * btn_gap
+    total_block_h = 104 + 5 * btn_h + 4 * btn_gap
     start_y = (win_h - total_block_h) // 2
 
     play_surf = font_hero.render("Play", True, TEXT_PRIMARY)
-    screen.blit(play_surf, play_surf.get_rect(center=(left_center_x, start_y + 22)))
+    screen.blit(play_surf, play_surf.get_rect(center=(left_center_x, start_y + 20)))
+
+    cur_alin = alin_profile["alin"]
+    tier_name = get_alin_tier(cur_alin)
+    beaten_cnt = len(alin_profile.get("defeated_bots", []))
+    alin_badge_rect = pygame.Rect(left_center_x - btn_w // 2, start_y + 54, btn_w, 34)
+    pygame.draw.rect(screen, BG_PANEL, alin_badge_rect, border_radius=8)
+    pygame.draw.rect(screen, ACCENT_GOLD, alin_badge_rect, width=1, border_radius=8)
+    alin_txt = f"Alin: {cur_alin} ({tier_name})  •  Bots Beaten: {beaten_cnt}/15"
+    alin_surf = font_small.render(alin_txt, True, ACCENT_GOLD)
+    screen.blit(alin_surf, alin_surf.get_rect(center=alin_badge_rect.center))
 
     modes = [
-        ("bots",     "\U0001F916", "Bots",           "Challenge Bluechair (Levels 1 - 15)"),
-        ("online",   "\U0001F310", "Online",         "Play over the internet"),
+        ("bots",     "\U0001F916", "Bots",           "Practice vs. Bluechair (Unrated)"),
+        ("online",   "\U0001F310", "Online",         "Play real players for Alin (Tomorrow)"),
         ("person",   "\U0001F4F1", "Play in Person", "Pass & play on this device"),
         ("analysis", "\U0001F50D", "Analysis",       "Explore moves freely"),
         ("setup",    "\U0001F6E0", "Setup Position", "Build custom boards & test puzzles"),
     ]
 
     for idx, (key, emoji_char, title, subtitle) in enumerate(modes):
-        by = start_y + 68 + idx * (btn_h + btn_gap)
+        by = start_y + 104 + idx * (btn_h + btn_gap)
         bx = left_center_x - btn_w // 2
         rect = menu_buttons[key]
         rect.update(bx, by, btn_w, btn_h)
@@ -1307,13 +1429,14 @@ def draw_main_menu(
         n_surf = font_small.render(menu_notice, True, ACCENT_GOLD)
         screen.blit(n_surf, n_surf.get_rect(center=(left_center_x, notice_y)))
 
-    btn_exit.update(24, 24, 150, 38)
-    draw_button(screen, btn_exit, "Exit (Esc)", font_small, mouse_pos)
+    if not IS_WEB:
+        btn_exit.update(24, 24, 150, 38)
+        draw_button(screen, btn_exit, "Exit (Esc)", font_small, mouse_pos)
 
 
 def draw_bot_select_menu(
     screen, win_w, win_h, board, board_y, board_size, sq_size,
-    mouse_pos, fonts, selected_bot_level, level_rects, btn_start_bot, btn_back_menu, btn_exit
+    mouse_pos, fonts, selected_bot_level, level_rects, btn_start_bot, btn_back_menu, btn_exit, alin_profile
 ):
     font_hero, font_title, font_bold, font_med, font_small, _ = fonts
     screen.fill(BG_MAIN)
@@ -1329,7 +1452,7 @@ def draw_bot_select_menu(
     panel_w = min(480, left_area_w - 48)
     panel_x = left_center_x - panel_w // 2
 
-    title_surf = font_title.render("Choose Bluechair Bot (1 - 15)", True, TEXT_PRIMARY)
+    title_surf = font_title.render(f"Choose Bluechair Bot  (Your Alin: {alin_profile['alin']})", True, TEXT_PRIMARY)
     screen.blit(title_surf, title_surf.get_rect(center=(left_center_x, board_y + 18)))
 
     cols = 3
@@ -1339,6 +1462,7 @@ def draw_bot_select_menu(
     card_w = (panel_w - (cols - 1) * gap_x) // cols
     card_h = 56
     grid_top = board_y + 52
+    defeated_set = set(alin_profile.get("defeated_bots", []))
 
     for lvl in range(1, 16):
         idx = lvl - 1
@@ -1351,6 +1475,7 @@ def draw_bot_select_menu(
 
         is_sel = (lvl == selected_bot_level)
         is_hov = rect.collidepoint(mouse_pos)
+        is_beaten = (lvl in defeated_set)
 
         if is_sel:
             bg = ACCENT_PURPLE if lvl == 15 else (ACCENT_RED if lvl == 1 else ACCENT_BLUE)
@@ -1363,11 +1488,12 @@ def draw_bot_select_menu(
 
         pygame.draw.rect(screen, bg, rect, border_radius=9)
         if not is_sel:
-            pygame.draw.rect(screen, (62, 59, 54), rect, width=1, border_radius=9)
+            pygame.draw.rect(screen, ACCENT_GREEN if is_beaten else (62, 59, 54), rect, width=1, border_radius=9)
 
         info = BOT_LEVELS[lvl]
-        lbl_surf = font_bold.render(info["name"], True, fg)
-        elo_surf = font_small.render(f"~{info['elo']}", True, sub_fg)
+        name_txt = info["name"] + (" *" if is_beaten else "")
+        lbl_surf = font_bold.render(name_txt, True, fg)
+        elo_surf = font_small.render(f"Alin {info['elo']}", True, ACCENT_GOLD if is_beaten and not is_sel else sub_fg)
         screen.blit(lbl_surf, (rect.x + 10, rect.y + 8))
         screen.blit(elo_surf, (rect.x + 10, rect.y + 31))
 
@@ -1378,7 +1504,7 @@ def draw_bot_select_menu(
 
     sel_info = BOT_LEVELS[selected_bot_level]
     badge_col = ACCENT_PURPLE if selected_bot_level == 15 else (ACCENT_RED if selected_bot_level == 1 else ACCENT_BLUE)
-    head_txt = f"{sel_info['name']}  ({sel_info['elo']})"
+    head_txt = f"{sel_info['name']}  (Alin {sel_info['elo']} • Unrated Practice)"
     screen.blit(font_bold.render(head_txt, True, badge_col), (details_rect.x + 16, details_rect.y + 12))
     screen.blit(font_small.render(sel_info["desc"], True, TEXT_MUTED), (details_rect.x + 16, details_rect.y + 40))
 
@@ -1392,8 +1518,9 @@ def draw_bot_select_menu(
     draw_button(screen, btn_start_bot, f"Play vs. {sel_info['name']}", font_bold, mouse_pos, bg=start_bg, hover=start_hov, text_col=(255, 255, 255))
     draw_button(screen, btn_back_menu, "Back to Main Menu (M)", font_small, mouse_pos)
 
-    btn_exit.update(24, 24, 150, 38)
-    draw_button(screen, btn_exit, "Exit (Esc)", font_small, mouse_pos)
+    if not IS_WEB:
+        btn_exit.update(24, 24, 150, 38)
+        draw_button(screen, btn_exit, "Exit (Esc)", font_small, mouse_pos)
 
 
 def draw_setup_ui(
@@ -1408,15 +1535,13 @@ def draw_setup_ui(
     top_bar_rect = pygame.Rect(board_x, board_y - bar_h - 6, board_size, bar_h)
     bot_bar_rect = pygame.Rect(board_x, board_y + board_size + 6, board_size, bar_h)
 
-    # Top & Bottom Setup Helper Bars
     pygame.draw.rect(screen, BG_PANEL, top_bar_rect, border_radius=6)
-    screen.blit(font_bold.render("Board Editor — Left-Click / Drag to Place • Right-Click to Erase", True, TEXT_PRIMARY), (top_bar_rect.x + 14, top_bar_rect.y + 11))
+    screen.blit(font_bold.render("Board Editor — Click / Drag to Place • Right-Click to Erase", True, TEXT_PRIMARY), (top_bar_rect.x + 14, top_bar_rect.y + 11))
 
     pygame.draw.rect(screen, BG_PANEL, bot_bar_rect, border_radius=6)
     tool_label = "Selected Tool: Eraser (Remove Piece)" if setup_tool == ("Erase", "Erase") else f"Selected Tool: {setup_tool[0]} {setup_tool[1]}"
     screen.blit(font_bold.render(tool_label, True, ACCENT_GOLD), (bot_bar_rect.x + 14, bot_bar_rect.y + 11))
 
-    # 8x8 Board
     board_border = pygame.Rect(board_x - 3, board_y - 3, board_size + 6, board_size + 6)
     pygame.draw.rect(screen, (55, 52, 48), board_border, border_radius=4)
 
@@ -1447,7 +1572,6 @@ def draw_setup_ui(
             if piece is not None:
                 draw_piece_at_pixel(screen, sq_rect.centerx, sq_rect.centery, piece, sq_size)
 
-    # Right Sidebar Editor Panel
     panel_x = board_x + board_size + 28
     panel_w = min(400, win_w - panel_x - 28)
     if panel_w >= 240:
@@ -1460,7 +1584,6 @@ def draw_setup_ui(
         pygame.draw.rect(screen, BG_PANEL_HEADER, header_rect, border_top_left_radius=10, border_top_right_radius=10)
         screen.blit(font_title.render("Position Setup", True, TEXT_PRIMARY), (panel_x + 18, panel_y + 12))
 
-        # Piece Palette Grid (White Row + Black Row)
         piece_order = ["Tacker", "Diamond", "Hop", "Hook", "Master", "King"]
         cell_gap = 6
         cell_size = (panel_w - 28 - 5 * cell_gap) // 6
@@ -1480,7 +1603,6 @@ def draw_setup_ui(
                 pygame.draw.rect(screen, (75, 71, 65), rect, width=1, border_radius=8)
                 draw_piece_at_pixel(screen, rect.centerx, rect.centery, Piece(color_name, p_name), int(cell_size * 0.84))
 
-        # Eraser & Quick Board Action Buttons
         row1_y = black_row_y + cell_size + 12
         half_w = (panel_w - 34) // 2
 
@@ -1504,7 +1626,6 @@ def draw_setup_ui(
         draw_button(screen, setup_btns["start_pos"], "Starting Position", font_small, mouse_pos)
         draw_button(screen, setup_btns["clear"], "Clear Board", font_small, mouse_pos)
 
-        # Turn & Bluechair Difficulty Controls
         row3_y = row2_y + 52
         setup_btns["turn"].update(panel_x + 14, row3_y, panel_w - 28, 40)
         turn_bg = (235, 235, 235) if setup_turn == "White" else (48, 46, 43)
@@ -1518,18 +1639,16 @@ def draw_setup_ui(
         mid_rect = pygame.Rect(panel_x + 14 + arrow_w + 6, row4_y, panel_w - 28 - 2 * arrow_w - 12, 38)
         pygame.draw.rect(screen, BG_PANEL_HEADER, mid_rect, border_radius=8)
         b_info = BOT_LEVELS[setup_bot_level]
-        bot_lbl = font_small.render(f"{b_info['name']} ({b_info['elo']})", True, ACCENT_BLUE)
+        bot_lbl = font_small.render(f"{b_info['name']} (Alin {b_info['elo']})", True, ACCENT_BLUE)
         screen.blit(bot_lbl, bot_lbl.get_rect(center=mid_rect.center))
         draw_button(screen, setup_btns["bot_prev"], "<", font_bold, mouse_pos)
         draw_button(screen, setup_btns["bot_next"], ">", font_bold, mouse_pos)
 
-        # Validation Warning / Status Message
         if setup_status_msg:
             warn_y = row4_y + 46
             warn_surf = font_small.render(setup_status_msg, True, ACCENT_RED)
             screen.blit(warn_surf, warn_surf.get_rect(center=(panel_x + panel_w // 2, warn_y + 10)))
 
-        # Launch & Back Buttons at Bottom
         btn_y1 = panel_rect.bottom - 156
         btn_y2 = panel_rect.bottom - 104
         btn_y3 = panel_rect.bottom - 52
@@ -1542,8 +1661,9 @@ def draw_setup_ui(
         draw_button(screen, setup_btns["play_person"], "Play in Person / Analysis", font_small, mouse_pos, bg=ACCENT_BLUE, hover=ACCENT_BLUE_HOVER, text_col=(255, 255, 255))
         draw_button(screen, setup_btns["back_menu"], "Back to Menu (M)", font_small, mouse_pos)
 
-    btn_exit.update(24, 24, 150, 38)
-    draw_button(screen, btn_exit, "Exit (Esc)", font_small, mouse_pos)
+    if not IS_WEB:
+        btn_exit.update(24, 24, 150, 38)
+        draw_button(screen, btn_exit, "Exit (Esc)", font_small, mouse_pos)
 
 
 def draw_game_ui(
@@ -1551,7 +1671,8 @@ def draw_game_ui(
     board, selected_sq, valid_moves, is_premove_selection, premove_queue,
     last_move, dragging_piece, active_anim, mouse_pos,
     current_turn, white_check, black_check, game_over_msg, move_history,
-    game_mode, bot_level, fonts, btn_menu, btn_reset, btn_resign, btn_exit
+    game_mode, bot_level, alin_profile, last_rating_banner,
+    fonts, btn_menu, btn_reset, btn_resign, btn_exit
 ):
     _, font_title, font_bold, font_med, font_small, font_coord = fonts
     screen.fill(BG_MAIN)
@@ -1559,50 +1680,65 @@ def draw_game_ui(
     white_king_pos = find_king(board, "White")
     black_king_pos = find_king(board, "Black")
 
-    bar_h = 44
+    bar_h = 54
     top_bar_rect = pygame.Rect(board_x, board_y - bar_h - 6, board_size, bar_h)
     bot_bar_rect = pygame.Rect(board_x, board_y + board_size + 6, board_size, bar_h)
 
+    player_alin = alin_profile["alin"]
+    player_tier = get_alin_tier(player_alin)
+
     if game_mode == "bots":
         b_info = BOT_LEVELS[bot_level]
-        black_name = f"{b_info['name']} ({b_info['elo']})"
+        bot_alin = b_info["elo"]
+        black_name = b_info["name"]
+        black_alin_sub = f"Alin: {bot_alin} ({get_alin_tier(bot_alin)}) • Unrated Bot"
         white_name = "You (White)"
+        white_alin_sub = f"Alin: {player_alin} ({player_tier})"
     elif game_mode == "analysis":
         black_name = "Black (Analysis)"
+        black_alin_sub = "Alin: Unrated"
         white_name = "White (Analysis)"
+        white_alin_sub = f"Alin: {player_alin} ({player_tier})"
     else:
         black_name = "Black"
+        black_alin_sub = "Alin: Local Guest (Unrated)"
         white_name = "White"
+        white_alin_sub = f"Alin: {player_alin} ({player_tier})"
 
+    # --- TOP PLAYER BAR (BLACK) ---
     pygame.draw.rect(screen, BG_PANEL, top_bar_rect, border_radius=6)
-    pygame.draw.rect(screen, BLACK_FILL, (top_bar_rect.x + 10, top_bar_rect.y + 8, 28, 28), border_radius=4)
-    pygame.draw.rect(screen, BLACK_OUTLINE, (top_bar_rect.x + 10, top_bar_rect.y + 8, 28, 28), width=2, border_radius=4)
+    pygame.draw.rect(screen, BLACK_FILL, (top_bar_rect.x + 12, top_bar_rect.y + 11, 32, 32), border_radius=5)
+    pygame.draw.rect(screen, BLACK_OUTLINE, (top_bar_rect.x + 12, top_bar_rect.y + 11, 32, 32), width=2, border_radius=5)
     black_label = black_name + ("  •  IN CHECK" if black_check else "")
-    screen.blit(font_bold.render(black_label, True, HIGHLIGHT_CHECK if black_check else TEXT_PRIMARY), (top_bar_rect.x + 48, top_bar_rect.y + 11))
+    screen.blit(font_bold.render(black_label, True, HIGHLIGHT_CHECK if black_check else TEXT_PRIMARY), (top_bar_rect.x + 54, top_bar_rect.y + 7))
+    screen.blit(font_small.render(black_alin_sub, True, ACCENT_GOLD if game_mode == "bots" else TEXT_MUTED), (top_bar_rect.x + 54, top_bar_rect.y + 29))
 
     if current_turn == "Black" and not game_over_msg:
-        pill = pygame.Rect(top_bar_rect.right - 135, top_bar_rect.y + 9, 123, 26)
+        pill = pygame.Rect(top_bar_rect.right - 135, top_bar_rect.y + 14, 123, 26)
         pygame.draw.rect(screen, ACCENT_GOLD if game_mode == "bots" else ACCENT_GREEN, pill, border_radius=5)
         t_surf = font_small.render("THINKING..." if game_mode == "bots" else "TURN", True, (20, 20, 20))
         screen.blit(t_surf, t_surf.get_rect(center=pill.center))
 
+    # --- BOTTOM PLAYER BAR (WHITE) ---
     pygame.draw.rect(screen, BG_PANEL, bot_bar_rect, border_radius=6)
-    pygame.draw.rect(screen, WHITE_FILL, (bot_bar_rect.x + 10, bot_bar_rect.y + 8, 28, 28), border_radius=4)
-    pygame.draw.rect(screen, WHITE_OUTLINE, (bot_bar_rect.x + 10, bot_bar_rect.y + 8, 28, 28), width=2, border_radius=4)
+    pygame.draw.rect(screen, WHITE_FILL, (bot_bar_rect.x + 12, bot_bar_rect.y + 11, 32, 32), border_radius=5)
+    pygame.draw.rect(screen, WHITE_OUTLINE, (bot_bar_rect.x + 12, bot_bar_rect.y + 11, 32, 32), width=2, border_radius=5)
     white_label = white_name + ("  •  IN CHECK" if white_check else "")
-    screen.blit(font_bold.render(white_label, True, HIGHLIGHT_CHECK if white_check else TEXT_PRIMARY), (bot_bar_rect.x + 48, bot_bar_rect.y + 11))
+    screen.blit(font_bold.render(white_label, True, HIGHLIGHT_CHECK if white_check else TEXT_PRIMARY), (bot_bar_rect.x + 54, bot_bar_rect.y + 7))
+    screen.blit(font_small.render(white_alin_sub, True, ACCENT_GOLD), (bot_bar_rect.x + 54, bot_bar_rect.y + 29))
 
     if premove_queue:
-        pill = pygame.Rect(bot_bar_rect.right - 190, bot_bar_rect.y + 9, 178, 26)
+        pill = pygame.Rect(bot_bar_rect.right - 190, bot_bar_rect.y + 14, 178, 26)
         pygame.draw.rect(screen, ACCENT_RED, pill, border_radius=5)
         t_surf = font_small.render(f"PREMOVES: {len(premove_queue)} (R-Click Clear)", True, (255, 255, 255))
         screen.blit(t_surf, t_surf.get_rect(center=pill.center))
     elif current_turn == "White" and not game_over_msg:
-        pill = pygame.Rect(bot_bar_rect.right - 110, bot_bar_rect.y + 9, 98, 26)
+        pill = pygame.Rect(bot_bar_rect.right - 110, bot_bar_rect.y + 14, 98, 26)
         pygame.draw.rect(screen, ACCENT_GREEN, pill, border_radius=5)
         t_surf = font_small.render("TURN", True, (20, 20, 20))
         screen.blit(t_surf, t_surf.get_rect(center=pill.center))
 
+    # --- BOARD ---
     board_border = pygame.Rect(board_x - 3, board_y - 3, board_size + 6, board_size + 6)
     pygame.draw.rect(screen, (55, 52, 48), board_border, border_radius=4)
 
@@ -1688,6 +1824,7 @@ def draw_game_ui(
         mx, my = mouse_pos
         draw_piece_at_pixel(screen, mx, my, dragging_piece, sq_size, font_coord)
 
+    # --- SIDEBAR ---
     panel_x = board_x + board_size + 28
     panel_w = min(380, win_w - panel_x - 28)
     if panel_w >= 220:
@@ -1708,10 +1845,17 @@ def draw_game_ui(
 
         status_y = panel_y + 62
         if game_over_msg:
-            banner_rect = pygame.Rect(panel_x + 14, status_y, panel_w - 28, 44)
+            banner_h = 62 if last_rating_banner else 44
+            banner_rect = pygame.Rect(panel_x + 14, status_y, panel_w - 28, banner_h)
             pygame.draw.rect(screen, ACCENT_GREEN, banner_rect, border_radius=7)
-            msg_surf = font_bold.render(game_over_msg, True, (20, 20, 20))
-            screen.blit(msg_surf, msg_surf.get_rect(center=banner_rect.center))
+            if last_rating_banner:
+                msg_surf = font_bold.render(game_over_msg, True, (20, 20, 20))
+                sub_surf = font_small.render(last_rating_banner, True, (25, 35, 18))
+                screen.blit(msg_surf, msg_surf.get_rect(center=(banner_rect.centerx, banner_rect.y + 20)))
+                screen.blit(sub_surf, sub_surf.get_rect(center=(banner_rect.centerx, banner_rect.y + 44)))
+            else:
+                msg_surf = font_bold.render(game_over_msg, True, (20, 20, 20))
+                screen.blit(msg_surf, msg_surf.get_rect(center=banner_rect.center))
         elif premove_queue:
             pm_list_str = ", ".join(f"{sq_to_algebraic(s)}{sq_to_algebraic(e)}" for s, e in premove_queue)
             status_txt = f"Queued: {pm_list_str}"
@@ -1722,8 +1866,8 @@ def draw_game_ui(
                 status_txt += "  (CHECK!)"
             screen.blit(font_med.render(status_txt, True, ACCENT_GOLD if (white_check or black_check) else TEXT_MUTED), (panel_x + 18, status_y + 10))
 
-        list_top = status_y + 56
-        list_bottom = panel_rect.bottom - 172
+        list_top = status_y + (72 if (game_over_msg and last_rating_banner) else 56)
+        list_bottom = panel_rect.bottom - (124 if IS_WEB else 172)
         list_h = max(100, list_bottom - list_top)
         list_rect = pygame.Rect(panel_x + 14, list_top, panel_w - 28, list_h)
         pygame.draw.rect(screen, BG_PANEL_HEADER, list_rect, border_radius=8)
@@ -1755,29 +1899,48 @@ def draw_game_ui(
             screen.blit(font_med.render(w_mv, True, TEXT_PRIMARY), (col_w_x, ry + 4))
             screen.blit(font_med.render(b_mv, True, TEXT_PRIMARY), (col_b_x, ry + 4))
 
-        btn_y1 = panel_rect.bottom - 156
-        btn_y2 = panel_rect.bottom - 104
-        btn_y3 = panel_rect.bottom - 52
         half_w = (panel_w - 38) // 2
+        if IS_WEB:
+            btn_y1 = panel_rect.bottom - 104
+            btn_y2 = panel_rect.bottom - 52
+            btn_reset.update(panel_x + 14, btn_y1, half_w, 42)
+            btn_resign.update(panel_x + 24 + half_w, btn_y1, half_w, 42)
+            btn_menu.update(panel_x + 14, btn_y2, panel_w - 28, 42)
+            draw_button(screen, btn_reset, "New Game (R)", font_small, mouse_pos, bg=ACCENT_GREEN, hover=ACCENT_GREEN_HOVER, text_col=(20, 20, 20))
+            draw_button(screen, btn_resign, "Resign (G)", font_small, mouse_pos)
+            draw_button(screen, btn_menu, "Back to Menu (M)", font_small, mouse_pos)
+        else:
+            btn_y1 = panel_rect.bottom - 156
+            btn_y2 = panel_rect.bottom - 104
+            btn_y3 = panel_rect.bottom - 52
+            btn_reset.update(panel_x + 14, btn_y1, half_w, 42)
+            btn_resign.update(panel_x + 24 + half_w, btn_y1, half_w, 42)
+            btn_menu.update(panel_x + 14, btn_y2, panel_w - 28, 42)
+            btn_exit.update(panel_x + 14, btn_y3, panel_w - 28, 42)
+            draw_button(screen, btn_reset, "New Game (R)", font_small, mouse_pos, bg=ACCENT_GREEN, hover=ACCENT_GREEN_HOVER, text_col=(20, 20, 20))
+            draw_button(screen, btn_resign, "Resign (G)", font_small, mouse_pos)
+            draw_button(screen, btn_menu, "Back to Menu (M)", font_small, mouse_pos)
+            draw_button(screen, btn_exit, "Exit Fullscreen (Esc)", font_small, mouse_pos)
 
-        btn_reset.update(panel_x + 14, btn_y1, half_w, 42)
-        btn_resign.update(panel_x + 24 + half_w, btn_y1, half_w, 42)
-        btn_menu.update(panel_x + 14, btn_y2, panel_w - 28, 42)
-        btn_exit.update(panel_x + 14, btn_y3, panel_w - 28, 42)
 
-        draw_button(screen, btn_reset, "New Game (R)", font_small, mouse_pos, bg=ACCENT_GREEN, hover=ACCENT_GREEN_HOVER, text_col=(20, 20, 20))
-        draw_button(screen, btn_resign, "Resign (G)", font_small, mouse_pos)
-        draw_button(screen, btn_menu, "Back to Menu (M)", font_small, mouse_pos)
-        draw_button(screen, btn_exit, "Exit Fullscreen (Esc)", font_small, mouse_pos)
+def make_web_safe_font(size, bold=False):
+    for fam in ("arial", "dejavusans", "freesans", "helvetica", "sans"):
+        if fam in pygame.font.get_fonts():
+            return pygame.font.SysFont(fam, size, bold=bold)
+    return pygame.font.Font(None, size)
 
 
-def main():
+async def main():
     pygame.init()
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-    win_w, win_h = screen.get_size()
+    if IS_WEB:
+        win_w, win_h = 1280, 720
+        screen = pygame.display.set_mode((win_w, win_h))
+    else:
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        win_w, win_h = screen.get_size()
     pygame.display.set_caption("Geometric Chess")
 
-    usable_h = win_h - 140
+    usable_h = win_h - 156
     sq_size = max(56, min(usable_h // 8, (win_w - 440) // 8))
     board_size = sq_size * 8
 
@@ -1787,29 +1950,29 @@ def main():
     board_y = (win_h - board_size) // 2
 
     fonts = (
-        pygame.font.SysFont("arial", 52, bold=True),
-        pygame.font.SysFont("arial", 22, bold=True),
-        pygame.font.SysFont("arial", 18, bold=True),
-        pygame.font.SysFont("arial", 16),
-        pygame.font.SysFont("arial", 14, bold=True),
-        pygame.font.SysFont("arial", max(11, sq_size // 6), bold=True),
+        make_web_safe_font(52, bold=True),
+        make_web_safe_font(22, bold=True),
+        make_web_safe_font(18, bold=True),
+        make_web_safe_font(16, bold=False),
+        make_web_safe_font(14, bold=True),
+        make_web_safe_font(max(11, sq_size // 6), bold=True),
     )
 
     emoji_font = None
-    for fam in ("segoe ui emoji", "apple color emoji", "noto color emoji", "symbola"):
-        if fam in pygame.font.get_fonts():
-            emoji_font = pygame.font.SysFont(fam, 26)
-            break
+    if not IS_WEB:
+        for fam in ("segoe ui emoji", "apple color emoji", "noto color emoji", "symbola"):
+            if fam in pygame.font.get_fonts():
+                emoji_font = pygame.font.SysFont(fam, 26)
+                break
 
     clock = pygame.time.Clock()
+    alin_profile = load_alin_profile()
 
-    # App States: "menu", "bot_select", "setup", or "playing"
     app_state = "menu"
     game_mode = "person"
     selected_bot_level = 8
     menu_notice = None
 
-    # Setup Editor State
     setup_board = create_board()
     setup_flipped = False
     setup_tool = ("White", "Master")
@@ -1827,6 +1990,8 @@ def main():
     dragging_piece = None
     active_anim = None
     game_over_msg = None
+    last_rating_banner = None
+    is_custom_match = False
     move_history = []
     position_counts = {}
 
@@ -1868,12 +2033,27 @@ def main():
     btn_resign = pygame.Rect(0, 0, 10, 10)
     btn_exit = pygame.Rect(0, 0, 10, 10)
 
+    def finalize_match_result(outcome):
+        nonlocal last_rating_banner
+        if game_mode == "bots":
+            if outcome == "win" and not is_custom_match:
+                defeated = alin_profile.setdefault("defeated_bots", [])
+                if selected_bot_level not in defeated:
+                    defeated.append(selected_bot_level)
+                    defeated.sort()
+                    save_alin_profile(alin_profile)
+            last_rating_banner = f"Alin: {alin_profile['alin']} (Unrated vs. Bot)"
+        else:
+            last_rating_banner = f"Alin: {alin_profile['alin']} (Rated vs. Real Players Only)"
+
     def start_mode(mode, custom_board=None, starting_turn="White"):
         nonlocal app_state, game_mode, board, current_turn, selected_sq, valid_moves
         nonlocal is_premove_selection, premove_queue, last_move, dragging_piece, active_anim
-        nonlocal game_over_msg, move_history, position_counts, white_check, black_check, bot_timer
+        nonlocal game_over_msg, last_rating_banner, is_custom_match, move_history, position_counts
+        nonlocal white_check, black_check, bot_timer
         game_mode = mode
         app_state = "playing"
+        is_custom_match = (custom_board is not None)
         board = clone_board(custom_board) if custom_board is not None else create_board()
         current_turn = starting_turn
         selected_sq = None
@@ -1884,11 +2064,12 @@ def main():
         dragging_piece = None
         active_anim = None
         game_over_msg = None
+        last_rating_banner = None
         move_history = []
         position_counts = {}
         evaluate_board_state(current_turn)
         if game_mode == "bots" and current_turn == "Black" and not game_over_msg:
-            bot_timer = 24
+            bot_timer = 18 if IS_WEB else 24
         else:
             bot_timer = 0
 
@@ -1906,8 +2087,10 @@ def main():
                 game_over_msg = f"CHECKMATE! {opponent} Wins!"
             else:
                 game_over_msg = f"STALEMATE! {opponent} Wins!"
+            finalize_match_result("win" if opponent == "White" else "lose")
         elif position_counts[h] >= 3:
             game_over_msg = "DRAW by Threefold Repetition!"
+            finalize_match_result("draw")
 
     def apply_setup_at_pixel(mx, my, erase_override=False):
         nonlocal setup_status_msg
@@ -1923,7 +2106,6 @@ def main():
             setup_board[r][c] = None
         else:
             color_name, piece_name = setup_tool
-            # Enforce max 1 King per color like Chess.com's board editor
             if piece_name == "King":
                 for rr in range(ROWS):
                     for cc in range(COLS):
@@ -1931,7 +2113,6 @@ def main():
                         if existing is not None and existing.color == color_name and existing.name == "King":
                             setup_board[rr][cc] = None
             new_p = Piece(color_name, piece_name)
-            # Mark Tackers placed off their home rank as already moved
             if piece_name == "Tacker":
                 home_r = 6 if color_name == "White" else 1
                 new_p.has_moved = (r != home_r)
@@ -2029,7 +2210,7 @@ def main():
         move_history.append(move_str)
 
         if game_mode == "bots" and current_turn == "Black" and not game_over_msg:
-            bot_timer = 24
+            bot_timer = 18 if IS_WEB else 24
 
     def try_trigger_queued_premove():
         nonlocal premove_queue
@@ -2053,7 +2234,8 @@ def main():
             premove_queue.clear()
             sync_dragged_piece_after_turn()
 
-    while True:
+    running = True
+    while running:
         clock.tick(60)
         mouse_pos = pygame.mouse.get_pos()
 
@@ -2074,13 +2256,11 @@ def main():
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
+                running = False
 
             if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    pygame.quit()
-                    sys.exit()
+                if event.key == pygame.K_ESCAPE and not IS_WEB:
+                    running = False
                 elif app_state in ("bot_select", "setup"):
                     if event.key == pygame.K_m:
                         app_state = "menu"
@@ -2103,6 +2283,7 @@ def main():
                     elif event.key == pygame.K_g and not game_over_msg:
                         winner = "Black" if current_turn == "White" else "White"
                         game_over_msg = f"{current_turn} Resigned — {winner} Wins!"
+                        finalize_match_result("win" if winner == "White" else "lose")
                         premove_queue.clear()
                         selected_sq = None
                         valid_moves = {}
@@ -2119,7 +2300,6 @@ def main():
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = event.pos
 
-                # Right-click in Setup erases square; in Playing clears premoves
                 if event.button == 3:
                     if app_state == "setup":
                         apply_setup_at_pixel(mx, my, erase_override=True)
@@ -2129,9 +2309,9 @@ def main():
                     continue
 
                 if event.button == 1:
-                    if btn_exit.collidepoint((mx, my)):
-                        pygame.quit()
-                        sys.exit()
+                    if not IS_WEB and btn_exit.collidepoint((mx, my)):
+                        running = False
+                        continue
 
                     if app_state == "menu":
                         if menu_buttons["bots"].collidepoint((mx, my)):
@@ -2146,7 +2326,7 @@ def main():
                             setup_status_msg = None
                             menu_notice = None
                         elif menu_buttons["online"].collidepoint((mx, my)):
-                            menu_notice = "Online matchmaking requires a server — try Bots or Play in Person!"
+                            menu_notice = "Online matchmaking vs. real players is coming tomorrow!"
                         continue
 
                     if app_state == "bot_select":
@@ -2210,6 +2390,7 @@ def main():
                     elif btn_resign.collidepoint((mx, my)) and not game_over_msg:
                         winner = "Black" if current_turn == "White" else "White"
                         game_over_msg = f"{current_turn} Resigned — {winner} Wins!"
+                        finalize_match_result("win" if winner == "White" else "lose")
                         premove_queue.clear()
                         selected_sq = None
                         valid_moves = {}
@@ -2289,12 +2470,12 @@ def main():
         if app_state == "menu":
             draw_main_menu(
                 screen, win_w, win_h, board, board_x, board_y, board_size, sq_size,
-                mouse_pos, fonts, emoji_font, menu_buttons, btn_exit, menu_notice
+                mouse_pos, fonts, emoji_font, menu_buttons, btn_exit, menu_notice, alin_profile
             )
         elif app_state == "bot_select":
             draw_bot_select_menu(
                 screen, win_w, win_h, board, board_y, board_size, sq_size,
-                mouse_pos, fonts, selected_bot_level, level_rects, btn_start_bot, btn_back_menu, btn_exit
+                mouse_pos, fonts, selected_bot_level, level_rects, btn_start_bot, btn_back_menu, btn_exit, alin_profile
             )
         elif app_state == "setup":
             draw_setup_ui(
@@ -2308,11 +2489,14 @@ def main():
                 board, selected_sq, valid_moves, is_premove_selection, premove_queue,
                 last_move, dragging_piece, active_anim, mouse_pos,
                 current_turn, white_check, black_check, game_over_msg, move_history,
-                game_mode, selected_bot_level, fonts, btn_menu, btn_reset, btn_resign, btn_exit
+                game_mode, selected_bot_level, alin_profile, last_rating_banner,
+                fonts, btn_menu, btn_reset, btn_resign, btn_exit
             )
 
         pygame.display.flip()
+        await asyncio.sleep(0)
+
+    pygame.quit()
 
 
-if __name__ == "__main__":
-    main()
+asyncio.run(main())
